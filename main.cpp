@@ -7,10 +7,14 @@
 
 using namespace libcamera;
 
+static std::shared_ptr<Camera> camera;
+
 void requestComplete(Request *request) {
 	if (request->status() == Request::RequestCancelled) {
 		return;
 	}
+	
+	std::cout << "Frame captured successfully" << std::endl;
 	
 	// Get buffers attached to the request
 	const Request::BufferMap &buffers = request->buffers();
@@ -41,8 +45,9 @@ void requestComplete(Request *request) {
 		munmap(address, length);
 	}
 	
-	// Requeue for continuous streaming
+	// Reuse and Requeue for continuous streaming
 	request->reuse(Request::ReuseBuffers);
+	camera->queueRequest(request);
 }
 
 int main() {
@@ -55,7 +60,7 @@ int main() {
 		}
 		
 		std::string cameraId = cm->cameras()[0]->id();
-		std::shared_ptr<Camera> camera = cm->get(cameraId);
+		camera = cm->get(cameraId);
 		camera->acquire();
 		
 		// Configuration
@@ -95,21 +100,7 @@ int main() {
 		}
 		
 		// Connect Request Complete signal (Callback handler)
-		camera->requestCompleted.connect([](Request *request) {
-			if (request->status() == Request::RequestCancelled) {
-				return;
-			}
-			
-			std::cout << "Frame captured successfully" << std::endl;
-			
-			// Processsing
-			
-			// Reuse request for the next frame cycle
-			request->reuse(Request::ReuseBuffers);
-			
-			// Re-queue the request to keep the camera streaming
-			camera->queueRequest(request);
-		});
+		camera->requestCompleted.connect(requestComplete);
 		
 		// Start
 		camera->start();
