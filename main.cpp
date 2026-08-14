@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -50,6 +51,57 @@ static cv::Mat mapToMat(void *address)
 	return {};
 }
 
+static cv::Mat frameToBgr(const cv::Mat &frame)
+{
+	cv::Mat bgr;
+	if (frameFormat == formats::BGR888) {
+		bgr = frame.clone();
+	} else if (frameFormat == formats::RGB888) {
+		cv::cvtColor(frame, bgr, cv::COLOR_RGB2BGR);
+	} else {
+		cv::cvtColor(frame, bgr, cv::COLOR_BGRA2BGR);
+	}
+	return bgr;
+}
+
+// Find the largest convex 4-corner contour (paper) and outline it.
+static void detectPaperEdges(cv::Mat &bgr)
+{
+	cv::Mat gray, edges;
+	cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+	cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0);
+	cv::Canny(gray, edges, 50, 150);
+
+	std::vector<std::vector<cv::Point>> contours;
+	cv::findContours(edges, contours, cv::RETR_LIST, cv::CHAIN_APPROX_SIMPLE);
+
+	double bestArea = 0.0;
+	std::vector<cv::Point> paper;
+	const double minArea = 0.05 * static_cast<double>(frameWidth) * static_cast<double>(frameHeight);
+
+	for (auto &contour : contours) {
+		double peri = cv::arcLength(contour, true);
+		std::vector<cv::Point> approx;
+		cv::approxPolyDP(contour, approx, 0.02 * peri, true);
+
+		if (approx.size() != 4 || !cv::isContourConvex(approx))
+			continue;
+
+		double area = std::fabs(cv::contourArea(approx));
+		if (area > bestArea) {
+			bestArea = area;
+			paper = std::move(approx);
+		}
+	}
+
+	if (!paper.empty() && bestArea >= minArea) {
+		const std::vector<std::vector<cv::Point>> outline = { paper };
+		cv::polylines(bgr, outline, true, cv::Scalar(0, 255, 0), 3);
+		for (const auto &pt : paper)
+			cv::circle(bgr, pt, 8, cv::Scalar(0, 0, 255), cv::FILLED);
+	}
+}
+
 static bool processRequest(Request *request)
 {
 	const Request::BufferMap &buffers = request->buffers();
@@ -73,18 +125,11 @@ static bool processRequest(Request *request)
 			return false;
 		}
 
-		cv::Mat gray;
-		if (frameFormat == formats::BGR888) {
-			cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
-		} else if (frameFormat == formats::RGB888) {
-			cv::cvtColor(frame, gray, cv::COLOR_RGB2GRAY);
-		} else {
-			cv::cvtColor(frame, gray, cv::COLOR_BGRA2GRAY);
-		}
-
-		cv::imshow("Libcamera OpenCV Stream", gray);
-
+		cv::Mat bgr = frameToBgr(frame);
 		munmap(address, length);
+
+		detectPaperEdges(bgr);
+		cv::imshow("Libcamera OpenCV Stream", bgr);
 	}
 
 	request->reuse(Request::ReuseBuffers);
