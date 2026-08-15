@@ -64,16 +64,23 @@ static cv::Mat frameToBgr(const cv::Mat &frame)
 	return bgr;
 }
 
-// Find the largest convex 4-corner contour (paper) and outline it.
+// Find the outer silhouette of a bright sheet (paper) and outline it.
+// Thresholding + RETR_EXTERNAL prefers the paper boundary over ink/drawings inside it.
 static void detectPaperEdges(cv::Mat &bgr)
 {
-	cv::Mat gray, edges;
+	cv::Mat gray, mask;
 	cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
 	cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0);
-	cv::Canny(gray, edges, 40, 120);
+
+	// Otsu picks a cutoff between dark background and bright paper.
+	cv::threshold(gray, mask, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+
+	// Close small gaps so the paper is one solid outer blob.
+	cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+	cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
 
 	std::vector<std::vector<cv::Point>> contours;
-	cv::findContours(edges, contours, cv::RETR_LIST, cv::CHAIN_APPROX_SIMPLE);
+	cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
 	double bestArea = 0.0;
 	std::vector<cv::Point> paper;
