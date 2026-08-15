@@ -2,7 +2,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <ctime>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -38,6 +40,10 @@ static Size stillSize{2592, 1944};
 static bool pageWasPresent = false;
 static std::chrono::steady_clock::time_point lastCaptureTime{};
 static std::optional<std::vector<cv::Point2f>> pendingHighResCapture;
+static std::vector<cv::Mat> keptPhotoFingerprints;
+
+// Mean abs difference on a small normalized gray image; below this => duplicate.
+static constexpr double kDuplicateDiffThreshold = 0.06;
 
 void requestComplete(Request *request)
 {
@@ -288,6 +294,93 @@ static std::string makeCaptureFilename()
 	return name.str();
 }
 
+static cv::Mat makeFingerprint(const cv::Mat &image)
+{
+	cv::Mat gray, small, fingerprint;
+	if (image.channels() == 1)
+		gray = image;
+	else
+		cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+
+	cv::resize(gray, small, cv::Size(64, 64), 0, 0, cv::INTER_AREA);
+	small.convertTo(fingerprint, CV_32F, 1.0 / 255.0);
+	cv::normalize(fingerprint, fingerprint, 0.0, 1.0, cv::NORM_MINMAX);
+	return fingerprint;
+}
+
+static bool fingerprintsMatch(const cv::Mat &a, const cv::Mat &b)
+{
+	if (a.empty() || b.empty() || a.size() != b.size())
+		return false;
+
+	const double diff = cv::norm(a, b, cv::NORM_L1) / (a.rows * a.cols);
+	return diff < kDuplicateDiffThreshold;
+}
+
+static bool matchesPreviousPhoto(const cv::Mat &image)
+{
+	const cv::Mat fingerprint = makeFingerprint(image);
+	for (const auto &previous : keptPhotoFingerprints) {
+		if (fingerprintsMatch(fingerprint, previous))
+			return true;
+	}
+	return false;
+}
+
+static void rememberPhoto(const cv::Mat &image)
+{
+	keptPhotoFingerprints.push_back(makeFingerprint(image));
+}
+
+static void loadExistingPhotoFingerprints()
+{
+	namespace fs = std::filesystem;
+	std::error_code ec;
+	for (const auto &entry : fs::directory_iterator(".", ec)) {
+		if (ec || !entry.is_regular_file())
+			continue;
+
+		const std::string name = entry.path().filename().string();
+		if (name.rfind("paper_", 0) != 0 || entry.path().extension() != ".jpg")
+			continue;
+
+		cv::Mat image = cv::imread(entry.path().string(), cv::IMREAD_COLOR);
+		if (image.empty())
+			continue;
+
+		rememberPhoto(image);
+		std::cout << "Indexed existing photo " << name << std::endl;
+	}
+}
+
+static bool savePaperJpegIfUnique(const cv::Mat &cropped)
+{
+	if (cropped.empty())
+		return false;
+
+	const std::string filename = makeCaptureFilename();
+	if (!cv::imwrite(filename, cropped)) {
+		std::cerr << "Failed to save " << filename << std::endl;
+		return false;
+	}
+
+	std::cout << "Saved " << filename << " (" << cropped.cols << 'x' << cropped.rows
+		  << ')' << std::endl;
+
+	if (matchesPreviousPhoto(cropped)) {
+		if (std::remove(filename.c_str()) == 0) {
+			std::cout << "Deleted " << filename
+				  << " (matches a previous photo)" << std::endl;
+		} else {
+			std::cerr << "Failed to delete duplicate " << filename << std::endl;
+		}
+		return false;
+	}
+
+	rememberPhoto(cropped);
+	return true;
+}
+
 static bool findPaper(const cv::Mat &bgr, std::vector<cv::Point> &paper)
 {
 	cv::Mat gray, mask;
@@ -376,16 +469,7 @@ static bool captureHighResJpeg(const std::vector<cv::Point2f> &normalizedCorners
 	if (gotFrame) {
 		std::vector<cv::Point> paper = denormalizeCorners(normalizedCorners);
 		cv::Mat cropped = extractPaper(bgr, paper);
-		if (!cropped.empty()) {
-			const std::string filename = makeCaptureFilename();
-			if (cv::imwrite(filename, cropped)) {
-				std::cout << "Saved " << filename << " (" << cropped.cols << 'x'
-					  << cropped.rows << ')' << std::endl;
-				saved = true;
-			} else {
-				std::cerr << "Failed to save " << filename << std::endl;
-			}
-		}
+		saved = savePaperJpegIfUnique(cropped);
 	}
 
 	stopStream();
@@ -453,6 +537,8 @@ int main()
 
 	stillSize = discoverStillSize();
 	std::cout << "Still capture size: " << stillSize.toString() << std::endl;
+
+	loadExistingPhotoFingerprints();
 
 	camera->requestCompleted.connect(requestComplete);
 
