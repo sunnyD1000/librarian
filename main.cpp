@@ -1,10 +1,14 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <ctime>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <sstream>
 #include <thread>
 #include <vector>
 #include <sys/mman.h>
@@ -22,6 +26,9 @@ static unsigned int frameWidth = 0;
 static unsigned int frameHeight = 0;
 static unsigned int frameStride = 0;
 static PixelFormat frameFormat;
+
+static bool pageWasPresent = false;
+static std::chrono::steady_clock::time_point lastCaptureTime{};
 
 // Keep the CameraManager callback light: only hand the request to the
 // main thread. Heavy work / OpenCV / queueRequest belong there.
@@ -64,18 +71,98 @@ static cv::Mat frameToBgr(const cv::Mat &frame)
 	return bgr;
 }
 
-// Find the outer silhouette of a bright sheet (paper) and outline it.
-// Thresholding + RETR_EXTERNAL prefers the paper boundary over ink/drawings inside it.
-static void detectPaperEdges(cv::Mat &bgr)
+// Order quad as TL, TR, BR, BL for a stable perspective warp.
+static std::vector<cv::Point2f> orderCorners(const std::vector<cv::Point> &pts)
+{
+	std::vector<cv::Point2f> corner(4);
+	std::vector<cv::Point2f> p;
+	p.reserve(4);
+	for (const auto &pt : pts)
+		p.emplace_back(static_cast<float>(pt.x), static_cast<float>(pt.y));
+
+	auto sumCmp = [](const cv::Point2f &a, const cv::Point2f &b) {
+		return (a.x + a.y) < (b.x + b.y);
+	};
+	auto diffCmp = [](const cv::Point2f &a, const cv::Point2f &b) {
+		return (a.y - a.x) < (b.y - b.x);
+	};
+
+	corner[0] = *std::min_element(p.begin(), p.end(), sumCmp); // TL
+	corner[2] = *std::max_element(p.begin(), p.end(), sumCmp); // BR
+	corner[1] = *std::min_element(p.begin(), p.end(), diffCmp); // TR
+	corner[3] = *std::max_element(p.begin(), p.end(), diffCmp); // BL
+	return corner;
+}
+
+static cv::Mat extractPaper(const cv::Mat &bgr, const std::vector<cv::Point> &paper)
+{
+	std::vector<cv::Point2f> src = orderCorners(paper);
+
+	float widthA = cv::norm(src[2] - src[3]);
+	float widthB = cv::norm(src[1] - src[0]);
+	float heightA = cv::norm(src[1] - src[2]);
+	float heightB = cv::norm(src[0] - src[3]);
+	int width = std::max(1, static_cast<int>(std::round(std::max(widthA, widthB))));
+	int height = std::max(1, static_cast<int>(std::round(std::max(heightA, heightB))));
+
+	std::vector<cv::Point2f> dst = {
+		{0.f, 0.f},
+		{static_cast<float>(width - 1), 0.f},
+		{static_cast<float>(width - 1), static_cast<float>(height - 1)},
+		{0.f, static_cast<float>(height - 1)},
+	};
+
+	cv::Mat transform = cv::getPerspectiveTransform(src, dst);
+	cv::Mat warped;
+	cv::warpPerspective(bgr, warped, transform, cv::Size(width, height));
+	return warped;
+}
+
+static std::string makeCaptureFilename()
+{
+	using clock = std::chrono::system_clock;
+	const auto now = clock::now();
+	const std::time_t t = clock::to_time_t(now);
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+				now.time_since_epoch()) %
+			1000;
+
+	std::tm tm{};
+	localtime_r(&t, &tm);
+
+	std::ostringstream name;
+	name << "paper_"
+	     << std::put_time(&tm, "%Y%m%d_%H%M%S")
+	     << '_' << std::setw(3) << std::setfill('0') << ms.count()
+	     << ".jpg";
+	return name.str();
+}
+
+static void savePaperJpeg(const cv::Mat &bgr, const std::vector<cv::Point> &paper)
+{
+	cv::Mat cropped = extractPaper(bgr, paper);
+	if (cropped.empty())
+		return;
+
+	const std::string filename = makeCaptureFilename();
+	if (cv::imwrite(filename, cropped)) {
+		std::cout << "Saved " << filename << " (" << cropped.cols << 'x'
+			  << cropped.rows << ')' << std::endl;
+	} else {
+		std::cerr << "Failed to save " << filename << std::endl;
+	}
+}
+
+// Find the outer silhouette of a bright sheet (paper).
+// Returns true and fills `paper` with 4 corners when found.
+static bool findPaper(const cv::Mat &bgr, std::vector<cv::Point> &paper)
 {
 	cv::Mat gray, mask;
 	cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
 	cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0);
 
-	// Otsu picks a cutoff between dark background and bright paper.
 	cv::threshold(gray, mask, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
 
-	// Close small gaps so the paper is one solid outer blob.
 	cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
 	cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
 
@@ -83,7 +170,7 @@ static void detectPaperEdges(cv::Mat &bgr)
 	cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
 	double bestArea = 0.0;
-	std::vector<cv::Point> paper;
+	paper.clear();
 	const double minArea = 0.05 * static_cast<double>(frameWidth) * static_cast<double>(frameHeight);
 
 	for (auto &contour : contours) {
@@ -101,12 +188,21 @@ static void detectPaperEdges(cv::Mat &bgr)
 		}
 	}
 
-	if (!paper.empty() && bestArea >= minArea) {
-		const std::vector<std::vector<cv::Point>> outline = { paper };
-		cv::polylines(bgr, outline, true, cv::Scalar(0, 255, 0), 3);
-		for (const auto &pt : paper)
-			cv::circle(bgr, pt, 8, cv::Scalar(0, 0, 255), cv::FILLED);
+	return !paper.empty() && bestArea >= minArea;
+}
+
+static void maybeCapturePage(const cv::Mat &bgr, const std::vector<cv::Point> &paper)
+{
+	const auto now = std::chrono::steady_clock::now();
+	const bool dueForResnap = pageWasPresent &&
+				  (now - lastCaptureTime) >= 5s;
+
+	if (!pageWasPresent || dueForResnap) {
+		savePaperJpeg(bgr, paper);
+		lastCaptureTime = now;
 	}
+
+	pageWasPresent = true;
 }
 
 static bool processRequest(Request *request)
@@ -135,7 +231,18 @@ static bool processRequest(Request *request)
 		cv::Mat bgr = frameToBgr(frame);
 		munmap(address, length);
 
-		detectPaperEdges(bgr);
+		std::vector<cv::Point> paper;
+		if (findPaper(bgr, paper)) {
+			maybeCapturePage(bgr, paper);
+
+			const std::vector<std::vector<cv::Point>> outline = { paper };
+			cv::polylines(bgr, outline, true, cv::Scalar(0, 255, 0), 3);
+			for (const auto &pt : paper)
+				cv::circle(bgr, pt, 8, cv::Scalar(0, 0, 255), cv::FILLED);
+		} else {
+			pageWasPresent = false;
+		}
+
 		cv::imshow("Libcamera OpenCV Stream", bgr);
 	}
 
@@ -162,9 +269,8 @@ int main()
 		camera->generateConfiguration({ StreamRole::Viewfinder });
 
 	StreamConfiguration &streamConfig = config->at(0);
-	// 25% less zoomed-in ≈ 25% wider FOV than 1920x1080 (often a cropped mode on Pi).
-	streamConfig.size = {2400, 1350};
-	// Prefer RGB888; validate() may still adjust size/format on the Pi.
+	// Full-FOV 4:3 binned mode (matches rpicam-still preview framing).
+	streamConfig.size = {1296, 972};
 	streamConfig.pixelFormat = formats::RGB888;
 
 	config->validate();
@@ -209,7 +315,6 @@ int main()
 
 	camera->requestCompleted.connect(requestComplete);
 
-	// Use the widest ScalerCrop for this mode (no extra digital zoom-in).
 	ControlList startControls;
 	if (auto cropMax = camera->properties().get(properties::ScalerCropMaximum)) {
 		Rectangle full = *cropMax;
@@ -222,8 +327,8 @@ int main()
 		camera->queueRequest(request.get());
 
 	std::cout << "Streaming — press 'q' in the preview window to quit" << std::endl;
+	std::cout << "Page JPEGs are saved in the current directory and kept on exit" << std::endl;
 
-	// Process completed frames on the main thread (safe for OpenCV GUI).
 	while (running) {
 		Request *request = nullptr;
 		{
