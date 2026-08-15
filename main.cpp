@@ -7,6 +7,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <sstream>
 #include <thread>
@@ -22,16 +23,22 @@ static std::shared_ptr<Camera> camera;
 static std::mutex requestMutex;
 static std::queue<Request *> completedRequests;
 static std::atomic<bool> running{true};
+
 static unsigned int frameWidth = 0;
 static unsigned int frameHeight = 0;
 static unsigned int frameStride = 0;
 static PixelFormat frameFormat;
+static Stream *activeStream = nullptr;
+static FrameBufferAllocator *allocator = nullptr;
+static std::vector<std::unique_ptr<Request>> requests;
+
+static const Size kPreviewSize{1296, 972};
+static Size stillSize{2592, 1944};
 
 static bool pageWasPresent = false;
 static std::chrono::steady_clock::time_point lastCaptureTime{};
+static std::optional<std::vector<cv::Point2f>> pendingHighResCapture;
 
-// Keep the CameraManager callback light: only hand the request to the
-// main thread. Heavy work / OpenCV / queueRequest belong there.
 void requestComplete(Request *request)
 {
 	if (request->status() == Request::RequestCancelled)
@@ -41,10 +48,15 @@ void requestComplete(Request *request)
 	completedRequests.push(request);
 }
 
+static void clearCompletedRequests()
+{
+	std::lock_guard<std::mutex> lock(requestMutex);
+	while (!completedRequests.empty())
+		completedRequests.pop();
+}
+
 static cv::Mat mapToMat(void *address)
 {
-	// OpenCV Mat rows/cols are (height, width). Use the real stride so
-	// padded rows from the camera do not overrun the buffer.
 	if (frameFormat == formats::BGR888) {
 		return cv::Mat(frameHeight, frameWidth, CV_8UC3, address, frameStride);
 	}
@@ -54,7 +66,6 @@ static cv::Mat mapToMat(void *address)
 	if (frameFormat == formats::XRGB8888 || frameFormat == formats::XBGR8888) {
 		return cv::Mat(frameHeight, frameWidth, CV_8UC4, address, frameStride);
 	}
-
 	return {};
 }
 
@@ -71,7 +82,146 @@ static cv::Mat frameToBgr(const cv::Mat &frame)
 	return bgr;
 }
 
-// Order quad as TL, TR, BR, BL for a stable perspective warp.
+static bool requestToBgr(Request *request, cv::Mat &bgr)
+{
+	const Request::BufferMap &buffers = request->buffers();
+	if (buffers.empty())
+		return false;
+
+	FrameBuffer *buffer = buffers.begin()->second;
+	const FrameBuffer::Plane &plane = buffer->planes()[0];
+	void *address = mmap(nullptr, plane.length, PROT_READ | PROT_WRITE, MAP_SHARED,
+			     plane.fd.get(), 0);
+	if (address == MAP_FAILED)
+		return false;
+
+	cv::Mat frame = mapToMat(address);
+	if (frame.empty()) {
+		munmap(address, plane.length);
+		return false;
+	}
+
+	bgr = frameToBgr(frame);
+	munmap(address, plane.length);
+	return !bgr.empty();
+}
+
+static Request *waitForCompletedRequest(std::chrono::milliseconds timeout)
+{
+	const auto deadline = std::chrono::steady_clock::now() + timeout;
+	while (std::chrono::steady_clock::now() < deadline) {
+		{
+			std::lock_guard<std::mutex> lock(requestMutex);
+			if (!completedRequests.empty()) {
+				Request *request = completedRequests.front();
+				completedRequests.pop();
+				return request;
+			}
+		}
+		std::this_thread::sleep_for(1ms);
+	}
+	return nullptr;
+}
+
+static void stopStream()
+{
+	if (!camera)
+		return;
+
+	camera->stop();
+	clearCompletedRequests();
+
+	if (allocator && activeStream) {
+		allocator->free(activeStream);
+		delete allocator;
+	}
+	allocator = nullptr;
+	activeStream = nullptr;
+	requests.clear();
+}
+
+static bool startStream(const Size &size, StreamRole role)
+{
+	std::unique_ptr<CameraConfiguration> config = camera->generateConfiguration({ role });
+	StreamConfiguration &streamConfig = config->at(0);
+	streamConfig.size = size;
+	streamConfig.pixelFormat = formats::RGB888;
+
+	config->validate();
+	std::cout << "Configured " << streamConfig.toString() << std::endl;
+
+	if (camera->configure(config.get()) < 0) {
+		std::cerr << "Camera configure failed" << std::endl;
+		return false;
+	}
+
+	frameWidth = streamConfig.size.width;
+	frameHeight = streamConfig.size.height;
+	frameStride = streamConfig.stride;
+	frameFormat = streamConfig.pixelFormat;
+	activeStream = streamConfig.stream();
+
+	allocator = new FrameBufferAllocator(camera);
+	if (allocator->allocate(activeStream) < 0) {
+		std::cerr << "Can't allocate buffers" << std::endl;
+		delete allocator;
+		allocator = nullptr;
+		activeStream = nullptr;
+		return false;
+	}
+
+	const std::vector<std::unique_ptr<FrameBuffer>> &buffers = allocator->buffers(activeStream);
+	for (const auto &buffer : buffers) {
+		std::unique_ptr<Request> request = camera->createRequest();
+		if (!request || request->addBuffer(activeStream, buffer.get()) < 0) {
+			std::cerr << "Can't create request" << std::endl;
+			stopStream();
+			return false;
+		}
+		requests.push_back(std::move(request));
+	}
+
+	ControlList startControls;
+	if (auto cropMax = camera->properties().get(properties::ScalerCropMaximum)) {
+		startControls.set(controls::ScalerCrop, *cropMax);
+	}
+
+	if (camera->start(&startControls) < 0) {
+		std::cerr << "Camera start failed" << std::endl;
+		stopStream();
+		return false;
+	}
+
+	for (auto &request : requests)
+		camera->queueRequest(request.get());
+
+	return true;
+}
+
+static std::vector<cv::Point2f> normalizeCorners(const std::vector<cv::Point> &paper)
+{
+	std::vector<cv::Point2f> normalized;
+	normalized.reserve(paper.size());
+	const float w = static_cast<float>(frameWidth);
+	const float h = static_cast<float>(frameHeight);
+	for (const auto &pt : paper) {
+		normalized.emplace_back(static_cast<float>(pt.x) / w,
+					static_cast<float>(pt.y) / h);
+	}
+	return normalized;
+}
+
+static std::vector<cv::Point> denormalizeCorners(const std::vector<cv::Point2f> &normalized)
+{
+	std::vector<cv::Point> paper;
+	paper.reserve(normalized.size());
+	for (const auto &pt : normalized) {
+		paper.emplace_back(static_cast<int>(std::lround(pt.x * frameWidth)),
+				   static_cast<int>(std::lround(pt.y * frameHeight)));
+	}
+	return paper;
+}
+
 static std::vector<cv::Point2f> orderCorners(const std::vector<cv::Point> &pts)
 {
 	std::vector<cv::Point2f> corner(4);
@@ -87,10 +237,10 @@ static std::vector<cv::Point2f> orderCorners(const std::vector<cv::Point> &pts)
 		return (a.y - a.x) < (b.y - b.x);
 	};
 
-	corner[0] = *std::min_element(p.begin(), p.end(), sumCmp); // TL
-	corner[2] = *std::max_element(p.begin(), p.end(), sumCmp); // BR
-	corner[1] = *std::min_element(p.begin(), p.end(), diffCmp); // TR
-	corner[3] = *std::max_element(p.begin(), p.end(), diffCmp); // BL
+	corner[0] = *std::min_element(p.begin(), p.end(), sumCmp);
+	corner[2] = *std::max_element(p.begin(), p.end(), sumCmp);
+	corner[1] = *std::min_element(p.begin(), p.end(), diffCmp);
+	corner[3] = *std::max_element(p.begin(), p.end(), diffCmp);
 	return corner;
 }
 
@@ -138,29 +288,11 @@ static std::string makeCaptureFilename()
 	return name.str();
 }
 
-static void savePaperJpeg(const cv::Mat &bgr, const std::vector<cv::Point> &paper)
-{
-	cv::Mat cropped = extractPaper(bgr, paper);
-	if (cropped.empty())
-		return;
-
-	const std::string filename = makeCaptureFilename();
-	if (cv::imwrite(filename, cropped)) {
-		std::cout << "Saved " << filename << " (" << cropped.cols << 'x'
-			  << cropped.rows << ')' << std::endl;
-	} else {
-		std::cerr << "Failed to save " << filename << std::endl;
-	}
-}
-
-// Find the outer silhouette of a bright sheet (paper).
-// Returns true and fills `paper` with 4 corners when found.
 static bool findPaper(const cv::Mat &bgr, std::vector<cv::Point> &paper)
 {
 	cv::Mat gray, mask;
 	cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
 	cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0);
-
 	cv::threshold(gray, mask, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
 
 	cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
@@ -191,64 +323,119 @@ static bool findPaper(const cv::Mat &bgr, std::vector<cv::Point> &paper)
 	return !paper.empty() && bestArea >= minArea;
 }
 
-static void maybeCapturePage(const cv::Mat &bgr, const std::vector<cv::Point> &paper)
+static void maybeCapturePage(const std::vector<cv::Point> &paper)
 {
+	if (pendingHighResCapture)
+		return;
+
 	const auto now = std::chrono::steady_clock::now();
-	const bool dueForResnap = pageWasPresent &&
-				  (now - lastCaptureTime) >= 5s;
+	const bool dueForResnap = pageWasPresent && (now - lastCaptureTime) >= 5s;
 
 	if (!pageWasPresent || dueForResnap) {
-		savePaperJpeg(bgr, paper);
+		// Keep paper location in normalized coords across the resolution switch.
+		pendingHighResCapture = normalizeCorners(paper);
 		lastCaptureTime = now;
 	}
 
 	pageWasPresent = true;
 }
 
+static bool captureHighResJpeg(const std::vector<cv::Point2f> &normalizedCorners)
+{
+	std::cout << "Switching to still resolution " << stillSize.toString()
+		  << " for capture..." << std::endl;
+
+	stopStream();
+	if (!startStream(stillSize, StreamRole::StillCapture)) {
+		std::cerr << "Failed to start still stream, restoring preview" << std::endl;
+		startStream(kPreviewSize, StreamRole::Viewfinder);
+		return false;
+	}
+
+	// Skip a couple frames so AE can settle at the new mode.
+	cv::Mat bgr;
+	bool gotFrame = false;
+	for (int i = 0; i < 3; ++i) {
+		Request *request = waitForCompletedRequest(2000ms);
+		if (!request) {
+			std::cerr << "Timed out waiting for still frame" << std::endl;
+			break;
+		}
+
+		cv::Mat frame;
+		if (requestToBgr(request, frame)) {
+			bgr = frame;
+			gotFrame = true;
+		}
+
+		request->reuse(Request::ReuseBuffers);
+		camera->queueRequest(request);
+	}
+
+	bool saved = false;
+	if (gotFrame) {
+		std::vector<cv::Point> paper = denormalizeCorners(normalizedCorners);
+		cv::Mat cropped = extractPaper(bgr, paper);
+		if (!cropped.empty()) {
+			const std::string filename = makeCaptureFilename();
+			if (cv::imwrite(filename, cropped)) {
+				std::cout << "Saved " << filename << " (" << cropped.cols << 'x'
+					  << cropped.rows << ')' << std::endl;
+				saved = true;
+			} else {
+				std::cerr << "Failed to save " << filename << std::endl;
+			}
+		}
+	}
+
+	stopStream();
+	if (!startStream(kPreviewSize, StreamRole::Viewfinder)) {
+		std::cerr << "Failed to restore preview stream" << std::endl;
+		running = false;
+		return false;
+	}
+
+	std::cout << "Restored preview " << kPreviewSize.toString() << std::endl;
+	return saved;
+}
+
 static bool processRequest(Request *request)
 {
-	const Request::BufferMap &buffers = request->buffers();
-	for (auto const &[stream, buffer] : buffers) {
-		(void)stream;
-
-		const FrameBuffer::Plane &plane = buffer->planes()[0];
-		int fd = plane.fd.get();
-		size_t length = plane.length;
-
-		void *address = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-		if (address == MAP_FAILED) {
-			std::cerr << "Failed to mmap buffer" << std::endl;
-			return false;
-		}
-
-		cv::Mat frame = mapToMat(address);
-		if (frame.empty()) {
-			std::cerr << "Unsupported pixel format: " << frameFormat.toString() << std::endl;
-			munmap(address, length);
-			return false;
-		}
-
-		cv::Mat bgr = frameToBgr(frame);
-		munmap(address, length);
-
-		std::vector<cv::Point> paper;
-		if (findPaper(bgr, paper)) {
-			maybeCapturePage(bgr, paper);
-
-			const std::vector<std::vector<cv::Point>> outline = { paper };
-			cv::polylines(bgr, outline, true, cv::Scalar(0, 255, 0), 3);
-			for (const auto &pt : paper)
-				cv::circle(bgr, pt, 8, cv::Scalar(0, 0, 255), cv::FILLED);
-		} else {
-			pageWasPresent = false;
-		}
-
-		cv::imshow("Libcamera OpenCV Stream", bgr);
+	cv::Mat bgr;
+	if (!requestToBgr(request, bgr)) {
+		std::cerr << "Failed to map frame" << std::endl;
+		request->reuse(Request::ReuseBuffers);
+		camera->queueRequest(request);
+		return false;
 	}
+
+	std::vector<cv::Point> paper;
+	if (findPaper(bgr, paper)) {
+		maybeCapturePage(paper);
+
+		const std::vector<std::vector<cv::Point>> outline = { paper };
+		cv::polylines(bgr, outline, true, cv::Scalar(0, 255, 0), 3);
+		for (const auto &pt : paper)
+			cv::circle(bgr, pt, 8, cv::Scalar(0, 0, 255), cv::FILLED);
+	} else {
+		pageWasPresent = false;
+	}
+
+	cv::imshow("Libcamera OpenCV Stream", bgr);
 
 	request->reuse(Request::ReuseBuffers);
 	camera->queueRequest(request);
 	return true;
+}
+
+static Size discoverStillSize()
+{
+	std::unique_ptr<CameraConfiguration> config =
+		camera->generateConfiguration({ StreamRole::StillCapture });
+	StreamConfiguration &streamConfig = config->at(0);
+	streamConfig.pixelFormat = formats::RGB888;
+	config->validate();
+	return streamConfig.size;
 }
 
 int main()
@@ -261,75 +448,31 @@ int main()
 		return -1;
 	}
 
-	std::string cameraId = cm->cameras()[0]->id();
-	camera = cm->get(cameraId);
+	camera = cm->get(cm->cameras()[0]->id());
 	camera->acquire();
 
-	std::unique_ptr<CameraConfiguration> config =
-		camera->generateConfiguration({ StreamRole::Viewfinder });
-
-	StreamConfiguration &streamConfig = config->at(0);
-	// Full-FOV 4:3 binned mode (matches rpicam-still preview framing).
-	streamConfig.size = {1296, 972};
-	streamConfig.pixelFormat = formats::RGB888;
-
-	config->validate();
-	std::cout << "Validated configuration: " << streamConfig.toString() << std::endl;
-
-	if (camera->configure(config.get()) < 0) {
-		std::cerr << "Camera configure failed" << std::endl;
-		return -1;
-	}
-
-	frameWidth = streamConfig.size.width;
-	frameHeight = streamConfig.size.height;
-	frameStride = streamConfig.stride;
-	frameFormat = streamConfig.pixelFormat;
-
-	Stream *stream = streamConfig.stream();
-
-	FrameBufferAllocator *allocator = new FrameBufferAllocator(camera);
-	if (allocator->allocate(stream) < 0) {
-		std::cerr << "Can't allocate buffers" << std::endl;
-		return -1;
-	}
-
-	const std::vector<std::unique_ptr<FrameBuffer>> &buffers = allocator->buffers(stream);
-	std::vector<std::unique_ptr<Request>> requests;
-
-	for (const auto &buffer : buffers) {
-		std::unique_ptr<Request> request = camera->createRequest();
-		if (!request) {
-			std::cerr << "Can't create request" << std::endl;
-			return -1;
-		}
-
-		int ret = request->addBuffer(stream, buffer.get());
-		if (ret < 0) {
-			std::cerr << "Can't set buffer for request" << std::endl;
-			return -1;
-		}
-
-		requests.push_back(std::move(request));
-	}
+	stillSize = discoverStillSize();
+	std::cout << "Still capture size: " << stillSize.toString() << std::endl;
 
 	camera->requestCompleted.connect(requestComplete);
 
-	ControlList startControls;
-	if (auto cropMax = camera->properties().get(properties::ScalerCropMaximum)) {
-		Rectangle full = *cropMax;
-		startControls.set(controls::ScalerCrop, full);
-		std::cout << "ScalerCrop: " << full.toString() << " (max FOV for mode)" << std::endl;
+	if (!startStream(kPreviewSize, StreamRole::Viewfinder)) {
+		camera->release();
+		cm->stop();
+		return -1;
 	}
-
-	camera->start(&startControls);
-	for (auto &request : requests)
-		camera->queueRequest(request.get());
 
 	std::cout << "Streaming — press 'q' in the preview window to quit" << std::endl;
 	std::cout << "Page JPEGs are saved in the current directory and kept on exit" << std::endl;
 
 	while (running) {
+		if (pendingHighResCapture) {
+			auto corners = *pendingHighResCapture;
+			pendingHighResCapture.reset();
+			captureHighResJpeg(corners);
+			continue;
+		}
+
 		Request *request = nullptr;
 		{
 			std::lock_guard<std::mutex> lock(requestMutex);
@@ -352,9 +495,7 @@ int main()
 	}
 
 	camera->requestCompleted.disconnect(requestComplete);
-	camera->stop();
-	allocator->free(stream);
-	delete allocator;
+	stopStream();
 	camera->release();
 	camera.reset();
 	cm->stop();
