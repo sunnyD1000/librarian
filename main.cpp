@@ -162,7 +162,8 @@ int main()
 		camera->generateConfiguration({ StreamRole::Viewfinder });
 
 	StreamConfiguration &streamConfig = config->at(0);
-	streamConfig.size = {1920, 1080};
+	// 25% less zoomed-in ≈ 25% wider FOV than 1920x1080 (often a cropped mode on Pi).
+	streamConfig.size = {2400, 1350};
 	// Prefer RGB888; validate() may still adjust size/format on the Pi.
 	streamConfig.pixelFormat = formats::RGB888;
 
@@ -208,7 +209,15 @@ int main()
 
 	camera->requestCompleted.connect(requestComplete);
 
-	camera->start();
+	// Use the widest ScalerCrop for this mode (no extra digital zoom-in).
+	ControlList startControls;
+	if (auto cropMax = camera->properties().get(properties::ScalerCropMaximum)) {
+		Rectangle full = *cropMax;
+		startControls.set(controls::ScalerCrop, full);
+		std::cout << "ScalerCrop: " << full.toString() << " (max FOV for mode)" << std::endl;
+	}
+
+	camera->start(&startControls);
 	for (auto &request : requests)
 		camera->queueRequest(request.get());
 
